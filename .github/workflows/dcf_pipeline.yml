@@ -1,0 +1,39 @@
+name: Autonomous DCF Research Desk
+
+on:
+  workflow_dispatch: # Allows you to click "Run workflow" manually
+  schedule:
+    - cron: '0 2 * * 1' # Wakes up every Monday at 2:00 AM UTC
+
+jobs:
+  analyze_and_file:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      # Pulls your API key securely from GitHub Secrets
+      FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Financial Libraries
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Execute Autonomous Scheduler
+        run: |
+          python scheduler.py
+
+      - name: Commit Excel Report & Update State
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "invest: auto-generated weekly DCF valuation report"
+          # This ensures it captures the updated tracker and the new Excel file
+          file_pattern: 'universe.csv reports/*/*.xlsx' 
