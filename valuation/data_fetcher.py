@@ -291,3 +291,93 @@ class FinancialDataFetcher:
             "equityWeight": record.get("equityWeight"),
             "debtWeight": record.get("debtWeight"),
         }
+
+    def get_current_price(self) -> dict[str, Any]:
+        """Return the current market price for the stock.
+
+        Uses the FMP ``/api/v3/quote/{ticker}`` endpoint, which provides the
+        latest trade price alongside volume and market-cap metadata.
+
+        Returns
+        -------
+        dict[str, Any]
+            A dictionary with the following keys:
+
+            * ``price`` – latest trade price (float, USD).
+            * ``symbol`` – normalised ticker symbol (str).
+
+        Raises
+        ------
+        DataFetchError
+            If the API call fails, no data is returned, or the ``price``
+            field is absent from the response.
+        """
+        url = f"{_BASE_V3}/quote/{self.ticker}"
+        payload = self._get(url)
+        records = self._require_list(payload, f"quote/{self.ticker}")
+        record = records[0]
+
+        price = record.get("price")
+        if price is None:
+            raise DataFetchError(
+                f"'price' field missing in FMP quote response for ticker "
+                f"'{self.ticker}'."
+            )
+
+        return {
+            "price": float(price),
+            "symbol": record.get("symbol", self.ticker),
+        }
+
+    def get_historical_fcf_growth(self, years: int = 5) -> float:
+        """Compute the historical average annual FCF growth rate.
+
+        Fetches up to *years* annual cash-flow statements and returns the
+        compound annual growth rate (CAGR) when both endpoints are positive.
+        Falls back to the average of valid year-over-year growth rates, and
+        ultimately to a 5 % default when no meaningful rate can be derived.
+
+        Parameters
+        ----------
+        years:
+            Number of historical annual periods to include.  Defaults to
+            ``5``.
+
+        Returns
+        -------
+        float
+            Historical FCF growth rate as a decimal (e.g. ``0.08`` for 8 %).
+        """
+        url = f"{_BASE_V3}/cash-flow-statement/{self.ticker}"
+        payload = self._get(url, params={"period": "annual", "limit": years})
+        try:
+            records = self._require_list(
+                payload, f"cash-flow-statement/{self.ticker}"
+            )
+        except DataFetchError:
+            return 0.05
+
+        # FMP returns records newest-first; reverse to chronological order.
+        fcf_values = [
+            float(r["freeCashFlow"])
+            for r in reversed(records)
+            if r.get("freeCashFlow") is not None
+        ]
+
+        if len(fcf_values) < 2:
+            return 0.05
+
+        oldest, latest = fcf_values[0], fcf_values[-1]
+        n = len(fcf_values) - 1
+
+        # Prefer CAGR when both endpoints are strictly positive.
+        if oldest > 0 and latest > 0:
+            return (latest / oldest) ** (1.0 / n) - 1.0
+
+        # Fallback: average the valid YoY growth rates.
+        growth_rates = [
+            curr / prev - 1.0
+            for prev, curr in zip(fcf_values, fcf_values[1:])
+            if prev > 0 and curr > 0
+        ]
+        return sum(growth_rates) / len(growth_rates) if growth_rates else 0.05
