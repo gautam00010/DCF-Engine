@@ -34,6 +34,5 @@ jobs:
       - name: Commit Excel Report & Update State
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          commit_message: "invest: auto-generated weekly DCF valuation report"
-          # This ensures it captures the updated tracker and the new Excel file
-          file_pattern: 'universe.csv reports/*/*.xlsx' 
+          commit_message: "invest: auto-generated weekly dual-engine DCF valuation reports"
+          file_pattern: 'universe_*.csv reports/*/*/*.xlsx' 
