@@ -3,23 +3,20 @@
 This script acts as the orchestration layer for the DCF Engine.  Each time it
 runs it:
 
-1. Loads (or auto-creates) a ticker universe from ``universe.csv``.
-2. Selects the ticker that has not been analysed most recently.
-3. Calls :func:`valuation.report_generator.run_scenario_analysis` to produce
-   a DCF valuation workbook.
-4. Files the report under ``reports/{ticker}/{ticker}_DCF_Report_{date}.xlsx``.
-5. Updates ``last_analyzed`` in ``universe.csv`` so the same ticker is not
-   re-selected next week.
-
-If the valuation engine raises any exception the CSV is **not** updated, so the
-same ticker will be retried on the next run.
+1. Loads (or auto-creates) two ticker universes: ``universe_usa.csv`` and
+   ``universe_india.csv``.
+2. Selects the stalest ticker from each universe independently.
+3. Calls :func:`valuation.report_generator.run_scenario_analysis` for both
+   tickers; if one fails the other is still attempted.
+4. Files reports under ``reports/USA/{ticker}/`` or ``reports/INDIA/{ticker}/``
+   respectively.
+5. Updates ``last_analyzed`` in each universe CSV only on success.
 
 Usage::
 
     python scheduler.py
 
-Environment variable ``FMP_API_KEY`` must be set (or passed via the
-``api_key`` argument inside the code).
+Environment variable ``FMP_API_KEY`` must be set for US stock valuations.
 """
 
 from __future__ import annotations
@@ -49,9 +46,12 @@ logger = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-_UNIVERSE_FILE = "universe.csv"
+_USA_UNIVERSE_FILE = "universe_usa.csv"
+_INDIA_UNIVERSE_FILE = "universe_india.csv"
 _REPORTS_DIR = "reports"
-_DEFAULT_TICKERS: list[str] = [
+
+_DEFAULT_USA_TICKERS: list[str] = ["AAPL", "MSFT", "NVDA", "TSLA", "AMZN"]
+_DEFAULT_INDIA_TICKERS: list[str] = [
     "RELIANCE.NS",
     "TCS.NS",
     "INFY.NS",
@@ -59,13 +59,18 @@ _DEFAULT_TICKERS: list[str] = [
     "ICICIBANK.NS",
 ]
 
+# Backward-compatibility alias
+_DEFAULT_TICKERS: list[str] = _DEFAULT_INDIA_TICKERS
+
 
 # ---------------------------------------------------------------------------
 # Universe helpers
 # ---------------------------------------------------------------------------
 
 
-def _load_or_create_universe(path: str = _UNIVERSE_FILE) -> pd.DataFrame:
+def _load_or_create_universe(
+    path: str, default_tickers: list[str] | None = None
+) -> pd.DataFrame:
     """Load the ticker universe CSV, or create it with defaults.
 
     The CSV has two columns:
@@ -76,14 +81,19 @@ def _load_or_create_universe(path: str = _UNIVERSE_FILE) -> pd.DataFrame:
     Parameters
     ----------
     path:
-        Path to the CSV file.  Defaults to ``universe.csv`` in the current
-        working directory.
+        Path to the CSV file.
+    default_tickers:
+        Tickers to use when creating a new file.  Defaults to
+        ``_DEFAULT_INDIA_TICKERS`` when ``None``.
 
     Returns
     -------
     pd.DataFrame
         DataFrame with columns ``["ticker", "last_analyzed"]``.
     """
+    if default_tickers is None:
+        default_tickers = _DEFAULT_INDIA_TICKERS
+
     if os.path.exists(path):
         logger.info("Loading universe from '%s'", path)
         df = pd.read_csv(path, dtype={"ticker": str, "last_analyzed": str})
@@ -103,10 +113,13 @@ def _load_or_create_universe(path: str = _UNIVERSE_FILE) -> pd.DataFrame:
     logger.warning(
         "'%s' not found – creating default universe with %d tickers.",
         path,
-        len(_DEFAULT_TICKERS),
+        len(default_tickers),
     )
     df = pd.DataFrame(
-        {"ticker": _DEFAULT_TICKERS, "last_analyzed": [""] * len(_DEFAULT_TICKERS)}
+        {
+            "ticker": default_tickers,
+            "last_analyzed": [""] * len(default_tickers),
+        }
     )
     df.to_csv(path, index=False)
     logger.info("Default universe saved to '%s'", path)
@@ -152,8 +165,17 @@ def _select_target(df: pd.DataFrame) -> str:
     return str(target)
 
 
+def _is_indian_ticker(ticker: str) -> bool:
+    """Return ``True`` if *ticker* is listed on an Indian exchange."""
+    upper = ticker.upper()
+    return upper.endswith(".NS") or upper.endswith(".BO")
+
+
 def _file_report(src_path: str, ticker: str, run_date: date) -> str:
-    """Copy the generated Excel file into the ``reports/{ticker}/`` folder.
+    """Copy the generated Excel file into the appropriate regional folder.
+
+    US tickers are filed under ``reports/USA/{ticker}/``; Indian tickers
+    (``*.NS`` / ``*.BO``) under ``reports/INDIA/{ticker}/``.
 
     Parameters
     ----------
@@ -170,7 +192,8 @@ def _file_report(src_path: str, ticker: str, run_date: date) -> str:
     str
         Absolute path of the filed report.
     """
-    dest_dir = os.path.join(_REPORTS_DIR, ticker)
+    region = "INDIA" if _is_indian_ticker(ticker) else "USA"
+    dest_dir = os.path.join(_REPORTS_DIR, region, ticker)
     os.makedirs(dest_dir, exist_ok=True)
     dest_filename = f"{ticker}_DCF_Report_{run_date.isoformat()}.xlsx"
     dest_path = os.path.join(dest_dir, dest_filename)
@@ -183,7 +206,7 @@ def _update_universe(
     df: pd.DataFrame,
     ticker: str,
     run_date: date,
-    path: str = _UNIVERSE_FILE,
+    path: str,
 ) -> None:
     """Write today's date for *ticker* back to the universe CSV.
 
@@ -213,48 +236,92 @@ def _update_universe(
 # ---------------------------------------------------------------------------
 
 
-def main(universe_path: str = _UNIVERSE_FILE) -> None:
+def main(
+    usa_universe_path: str = _USA_UNIVERSE_FILE,
+    india_universe_path: str = _INDIA_UNIVERSE_FILE,
+) -> None:
     """Run one iteration of the weekly equity research pipeline.
+
+    Selects the stalest ticker from the USA universe and the stalest ticker
+    from the India universe, then runs both valuations independently.  If one
+    valuation fails the other is still attempted.  Exits with code 1 only if
+    both valuations fail.
 
     Parameters
     ----------
-    universe_path:
-        Path to the universe CSV file.  Defaults to ``universe.csv``.
+    usa_universe_path:
+        Path to the US ticker universe CSV.  Defaults to ``universe_usa.csv``.
+    india_universe_path:
+        Path to the India ticker universe CSV.  Defaults to
+        ``universe_india.csv``.
     """
     logger.info("=" * 60)
     logger.info("DCF Engine – Autonomous Weekly Scheduler starting")
     logger.info("=" * 60)
 
-    # 1. Load / create the universe
-    df = _load_or_create_universe(universe_path)
-
-    # 2. Select the target ticker
-    target = _select_target(df)
     run_date = date.today()
+    usa_success = False
+    india_success = False
 
-    # 3. Run the valuation engine (fail-safe: no CSV update on error)
+    # ------------------------------------------------------------------
+    # USA valuation
+    # ------------------------------------------------------------------
+    df_usa = _load_or_create_universe(usa_universe_path, _DEFAULT_USA_TICKERS)
+    usa_target = _select_target(df_usa)
+
     try:
-        logger.info("Running scenario analysis for '%s' …", target)
-        src_path = run_scenario_analysis(target)
-        logger.info("Scenario analysis complete.  Excel output: '%s'", src_path)
+        logger.info("INFO     Running scenario analysis for '%s' …", usa_target)
+        src_path = run_scenario_analysis(usa_target)
+        logger.info("INFO     Scenario analysis complete.  Excel output: '%s'", src_path)
+        _file_report(src_path, usa_target, run_date)
+        _update_universe(df_usa, usa_target, run_date, usa_universe_path)
+        usa_success = True
     except Exception as exc:
         logger.critical(
-            "Valuation engine failed for '%s': %s – universe.csv NOT updated; "
+            "Valuation engine failed for '%s': %s – %s NOT updated; "
             "this ticker will be retried next run.",
-            target,
+            usa_target,
             exc,
+            usa_universe_path,
             exc_info=True,
         )
-        sys.exit(1)
 
-    # 4. File the report into reports/{ticker}/
-    _file_report(src_path, target, run_date)
+    # ------------------------------------------------------------------
+    # India valuation
+    # ------------------------------------------------------------------
+    df_india = _load_or_create_universe(india_universe_path, _DEFAULT_INDIA_TICKERS)
+    india_target = _select_target(df_india)
 
-    # 5. Update the universe CSV with today's date
-    _update_universe(df, target, run_date, universe_path)
+    try:
+        logger.info("INFO     Running scenario analysis for '%s' …", india_target)
+        src_path = run_scenario_analysis(india_target)
+        logger.info("INFO     Scenario analysis complete.  Excel output: '%s'", src_path)
+        _file_report(src_path, india_target, run_date)
+        _update_universe(df_india, india_target, run_date, india_universe_path)
+        india_success = True
+    except Exception as exc:
+        logger.critical(
+            "Valuation engine failed for '%s': %s – %s NOT updated; "
+            "this ticker will be retried next run.",
+            india_target,
+            exc,
+            india_universe_path,
+            exc_info=True,
+        )
 
+    # ------------------------------------------------------------------
+    # Final status
+    # ------------------------------------------------------------------
     logger.info("=" * 60)
-    logger.info("Weekly run complete.  Target: %s", target)
+    if usa_success or india_success:
+        logger.info(
+            "Weekly run complete.  USA: %s  |  India: %s",
+            usa_target if usa_success else "FAILED",
+            india_target if india_success else "FAILED",
+        )
+    else:
+        logger.critical("Both USA and India valuations failed this run.")
+        sys.exit(1)
     logger.info("=" * 60)
 
 

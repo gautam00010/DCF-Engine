@@ -1,4 +1,4 @@
-"""Unit tests for valuation.report_generator and the new FinancialDataFetcher
+"""Unit tests for valuation.report_generator and the new data fetcher
 methods get_current_price / get_historical_fcf_growth.
 
 All tests are fully offline – no real HTTP calls are made.
@@ -210,14 +210,14 @@ def _make_mock_fetcher(
 
 
 class TestRunScenarioAnalysis(unittest.TestCase):
-    """End-to-end tests with mocked FinancialDataFetcher and temp output dir."""
+    """End-to-end tests with mocked get_fetcher and temp output dir."""
 
     def _run(self, ticker: str = _TICKER, **fetcher_overrides) -> str:
         mock_fetcher = _make_mock_fetcher(**fetcher_overrides)
         with tempfile.TemporaryDirectory() as tmpdir:
             with (
                 patch(
-                    "valuation.report_generator.FinancialDataFetcher",
+                    "valuation.report_generator.get_fetcher",
                     return_value=mock_fetcher,
                 ),
                 patch(
@@ -249,7 +249,7 @@ class TestRunScenarioAnalysis(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             with (
                 patch(
-                    "valuation.report_generator.FinancialDataFetcher",
+                    "valuation.report_generator.get_fetcher",
                     return_value=mock_fetcher,
                 ),
                 patch("valuation.report_generator.os.makedirs"),
@@ -264,7 +264,7 @@ class TestRunScenarioAnalysis(unittest.TestCase):
         mock_fetcher = _make_mock_fetcher()
         with (
             patch(
-                "valuation.report_generator.FinancialDataFetcher",
+                "valuation.report_generator.get_fetcher",
                 return_value=mock_fetcher,
             ),
             patch("valuation.report_generator.os.makedirs"),
@@ -277,7 +277,7 @@ class TestRunScenarioAnalysis(unittest.TestCase):
         mock_fetcher = _make_mock_fetcher()
         with (
             patch(
-                "valuation.report_generator.FinancialDataFetcher",
+                "valuation.report_generator.get_fetcher",
                 return_value=mock_fetcher,
             ),
             patch("valuation.report_generator.os.makedirs"),
@@ -295,7 +295,7 @@ class TestRunScenarioAnalysis(unittest.TestCase):
         mock_fetcher = _make_mock_fetcher()
         with (
             patch(
-                "valuation.report_generator.FinancialDataFetcher",
+                "valuation.report_generator.get_fetcher",
                 return_value=mock_fetcher,
             ),
             patch(
@@ -314,7 +314,7 @@ class TestRunScenarioAnalysis(unittest.TestCase):
         mock_fetcher = _make_mock_fetcher()
         with (
             patch(
-                "valuation.report_generator.FinancialDataFetcher",
+                "valuation.report_generator.get_fetcher",
                 return_value=mock_fetcher,
             ),
             patch("valuation.report_generator.os.makedirs"),
@@ -332,7 +332,7 @@ class TestRunScenarioAnalysis(unittest.TestCase):
         mock_fetcher = _make_mock_fetcher()
         with (
             patch(
-                "valuation.report_generator.FinancialDataFetcher",
+                "valuation.report_generator.get_fetcher",
                 return_value=mock_fetcher,
             ),
             patch("valuation.report_generator.os.makedirs"),
@@ -349,7 +349,7 @@ class TestRunScenarioAnalysis(unittest.TestCase):
         mock_fetcher = _make_mock_fetcher()
         with (
             patch(
-                "valuation.report_generator.FinancialDataFetcher",
+                "valuation.report_generator.get_fetcher",
                 return_value=mock_fetcher,
             ),
             patch("valuation.report_generator.os.makedirs"),
@@ -371,7 +371,7 @@ class TestRunScenarioAnalysis(unittest.TestCase):
         mock_fetcher = _make_mock_fetcher()
         with (
             patch(
-                "valuation.report_generator.FinancialDataFetcher",
+                "valuation.report_generator.get_fetcher",
                 return_value=mock_fetcher,
             ),
             patch("valuation.report_generator.os.makedirs"),
@@ -391,7 +391,7 @@ class TestRunScenarioAnalysis(unittest.TestCase):
         mock_fetcher = _make_mock_fetcher(base_growth=0.08)
         with (
             patch(
-                "valuation.report_generator.FinancialDataFetcher",
+                "valuation.report_generator.get_fetcher",
                 return_value=mock_fetcher,
             ),
             patch("valuation.report_generator.os.makedirs"),
@@ -411,7 +411,7 @@ class TestRunScenarioAnalysis(unittest.TestCase):
         mock_fetcher = _make_mock_fetcher()
         with (
             patch(
-                "valuation.report_generator.FinancialDataFetcher",
+                "valuation.report_generator.get_fetcher",
                 return_value=mock_fetcher,
             ),
             patch("valuation.report_generator.os.makedirs"),
