@@ -38,7 +38,9 @@ def _make_df(**rows) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 from scheduler import (
+    _DEFAULT_INDIA_TICKERS,
     _DEFAULT_TICKERS,
+    _DEFAULT_USA_TICKERS,
     _file_report,
     _load_or_create_universe,
     _select_target,
@@ -267,9 +269,10 @@ class TestUpdateUniverse(unittest.TestCase):
 class TestMain(unittest.TestCase):
     def setUp(self) -> None:
         self.tmpdir = tempfile.mkdtemp()
-        self.universe_path = os.path.join(self.tmpdir, "universe.csv")
+        self.universe_path = os.path.join(self.tmpdir, "universe_usa.csv")
+        self.india_universe_path = os.path.join(self.tmpdir, "universe_india.csv")
         # Create a fake Excel file that run_scenario_analysis "returns"
-        self.fake_excel = os.path.join(self.tmpdir, "RELIANCE.NS_DCF_Valuation.xlsx")
+        self.fake_excel = os.path.join(self.tmpdir, "fake_DCF_Valuation.xlsx")
         with open(self.fake_excel, "wb") as f:
             f.write(b"fake")
 
@@ -285,7 +288,7 @@ class TestMain(unittest.TestCase):
                 mock_run_scenario,
             ),
         ):
-            main(self.universe_path)
+            main(self.universe_path, self.india_universe_path)
 
     def test_main_creates_universe_if_missing(self) -> None:
         mock_rsa = MagicMock(return_value=self.fake_excel)
@@ -293,25 +296,27 @@ class TestMain(unittest.TestCase):
         self.assertTrue(os.path.isfile(self.universe_path))
 
     def test_main_calls_run_scenario_analysis(self) -> None:
+        """run_scenario_analysis is called once for USA and once for India."""
         mock_rsa = MagicMock(return_value=self.fake_excel)
         self._run_main(mock_rsa)
-        mock_rsa.assert_called_once()
+        self.assertEqual(mock_rsa.call_count, 2)
 
     def test_main_updates_universe_csv_on_success(self) -> None:
         mock_rsa = MagicMock(return_value=self.fake_excel)
         self._run_main(mock_rsa)
         df = pd.read_csv(self.universe_path)
         today = date.today().isoformat()
-        # The first (oldest/blank) ticker should now have today's date
+        # The first (oldest/blank) USA ticker should now have today's date
         first_ticker_date = df.iloc[0]["last_analyzed"]
         self.assertEqual(first_ticker_date, today)
 
     def test_main_does_not_update_csv_on_failure(self) -> None:
-        # Pre-create the universe so we can check it wasn't modified
+        # Pre-create the USA universe so we can check it wasn't modified
         pd.DataFrame(
             {"ticker": ["A", "B"], "last_analyzed": ["", ""]}
         ).to_csv(self.universe_path, index=False)
 
+        # Both USA and India fail → sys.exit(1)
         mock_rsa = MagicMock(side_effect=RuntimeError("API timeout"))
         with self.assertRaises(SystemExit):
             self._run_main(mock_rsa)
@@ -320,19 +325,33 @@ class TestMain(unittest.TestCase):
         # Dates should still be blank / NaN
         self.assertTrue(df["last_analyzed"].isna().all() or (df["last_analyzed"] == "").all())
 
-    def test_main_files_report_to_correct_folder(self) -> None:
+    def test_main_files_usa_report_to_usa_folder(self) -> None:
         mock_rsa = MagicMock(return_value=self.fake_excel)
         reports_dir = os.path.join(self.tmpdir, "reports")
         with (
             patch("scheduler._REPORTS_DIR", reports_dir),
             patch("scheduler.run_scenario_analysis", mock_rsa),
         ):
-            main(self.universe_path)
+            main(self.universe_path, self.india_universe_path)
 
-        # First default ticker is RELIANCE.NS; folder should exist
-        target_dir = os.path.join(reports_dir, "RELIANCE.NS")
+        # First USA default ticker is AAPL → reports/USA/AAPL/
+        target_dir = os.path.join(reports_dir, "USA", "AAPL")
         self.assertTrue(os.path.isdir(target_dir))
-        # At least one .xlsx file should have been placed in that folder
+        xlsx_files = [f for f in os.listdir(target_dir) if f.endswith(".xlsx")]
+        self.assertTrue(len(xlsx_files) > 0)
+
+    def test_main_files_india_report_to_india_folder(self) -> None:
+        mock_rsa = MagicMock(return_value=self.fake_excel)
+        reports_dir = os.path.join(self.tmpdir, "reports")
+        with (
+            patch("scheduler._REPORTS_DIR", reports_dir),
+            patch("scheduler.run_scenario_analysis", mock_rsa),
+        ):
+            main(self.universe_path, self.india_universe_path)
+
+        # First India default ticker is RELIANCE.NS → reports/INDIA/RELIANCE.NS/
+        target_dir = os.path.join(reports_dir, "INDIA", "RELIANCE.NS")
+        self.assertTrue(os.path.isdir(target_dir))
         xlsx_files = [f for f in os.listdir(target_dir) if f.endswith(".xlsx")]
         self.assertTrue(len(xlsx_files) > 0)
 
@@ -343,11 +362,11 @@ class TestMain(unittest.TestCase):
             patch("scheduler._REPORTS_DIR", reports_dir),
             patch("scheduler.run_scenario_analysis", mock_rsa),
         ):
-            main(self.universe_path)
+            main(self.universe_path, self.india_universe_path)
 
         today = date.today().isoformat()
         expected_name = f"RELIANCE.NS_DCF_Report_{today}.xlsx"
-        target_dir = os.path.join(reports_dir, "RELIANCE.NS")
+        target_dir = os.path.join(reports_dir, "INDIA", "RELIANCE.NS")
         self.assertIn(expected_name, os.listdir(target_dir))
 
     def test_main_selects_oldest_ticker(self) -> None:
@@ -361,25 +380,56 @@ class TestMain(unittest.TestCase):
             }
         ).to_csv(self.universe_path, index=False)
 
-        fake_excel_tsla = os.path.join(self.tmpdir, "TSLA_DCF_Valuation.xlsx")
-        with open(fake_excel_tsla, "wb") as f:
-            f.write(b"fake")
-
-        mock_rsa = MagicMock(return_value=fake_excel_tsla)
+        mock_rsa = MagicMock(return_value=self.fake_excel)
         reports_dir = os.path.join(self.tmpdir, "reports")
         with (
             patch("scheduler._REPORTS_DIR", reports_dir),
             patch("scheduler.run_scenario_analysis", mock_rsa),
         ):
-            main(self.universe_path)
+            main(self.universe_path, self.india_universe_path)
 
-        mock_rsa.assert_called_once_with("TSLA")
+        # TSLA should have been selected from the USA universe
+        call_args = [str(call[0][0]) for call in mock_rsa.call_args_list]
+        self.assertIn("TSLA", call_args)
 
     def test_main_exits_nonzero_on_engine_failure(self) -> None:
+        """sys.exit(1) when both USA and India valuations fail."""
         mock_rsa = MagicMock(side_effect=ConnectionError("network down"))
         with self.assertRaises(SystemExit) as ctx:
             self._run_main(mock_rsa)
         self.assertNotEqual(ctx.exception.code, 0)
+
+    def test_main_india_failure_does_not_block_usa(self) -> None:
+        """If India fails but USA succeeds, no SystemExit is raised."""
+        def _side_effect(ticker):
+            from scheduler import _is_indian_ticker
+            if _is_indian_ticker(ticker):
+                raise RuntimeError("India API down")
+            return self.fake_excel
+
+        mock_rsa = MagicMock(side_effect=_side_effect)
+        # Should not raise SystemExit – USA succeeds
+        self._run_main(mock_rsa)
+        # USA CSV should be updated
+        df = pd.read_csv(self.universe_path)
+        today = date.today().isoformat()
+        self.assertEqual(df.iloc[0]["last_analyzed"], today)
+
+    def test_main_usa_failure_does_not_block_india(self) -> None:
+        """If USA fails but India succeeds, no SystemExit is raised."""
+        def _side_effect(ticker):
+            from scheduler import _is_indian_ticker
+            if not _is_indian_ticker(ticker):
+                raise RuntimeError("FMP API down")
+            return self.fake_excel
+
+        mock_rsa = MagicMock(side_effect=_side_effect)
+        # Should not raise SystemExit – India succeeds
+        self._run_main(mock_rsa)
+        # India CSV should be updated
+        df = pd.read_csv(self.india_universe_path)
+        today = date.today().isoformat()
+        self.assertEqual(df.iloc[0]["last_analyzed"], today)
 
 
 if __name__ == "__main__":

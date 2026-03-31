@@ -1,13 +1,21 @@
 """Data ingestion module for the DCF Engine.
 
-Provides :class:`FinancialDataFetcher`, which wraps the Financial Modeling
-Prep (FMP) REST API and returns clean, typed data structures consumed by the
-downstream valuation pipeline.
+Provides a factory function :func:`get_fetcher` that returns the appropriate
+data fetcher based on the ticker symbol.  US tickers use
+:class:`FMPDataFetcher` (Financial Modeling Prep REST API); Indian tickers
+(``*.NS`` / ``*.BO``) use :class:`YFinanceDataFetcher`.
+
+Both fetchers inherit from :class:`BaseDataFetcher` and return identical
+dictionary structures so downstream code (``dcf_model.py``) remains unchanged.
+
+For backward compatibility, ``FinancialDataFetcher`` is retained as an alias
+for ``FMPDataFetcher``.
 """
 
 from __future__ import annotations
 
 import os
+from abc import ABC, abstractmethod
 from typing import Any
 
 import requests
@@ -18,15 +26,51 @@ import requests
 
 
 class DataFetchError(Exception):
-    """Raised when data cannot be retrieved from the FMP API.
+    """Raised when data cannot be retrieved from a data source.
 
     This covers network failures, HTTP error responses, invalid tickers, and
-    any unexpected payload shape returned by the API.
+    any unexpected payload shape returned by an API or data library.
     """
 
 
 # ---------------------------------------------------------------------------
-# Main fetcher class
+# Abstract base class
+# ---------------------------------------------------------------------------
+
+
+class BaseDataFetcher(ABC):
+    """Abstract interface for equity data fetchers.
+
+    All concrete fetchers must implement the five methods below and return
+    dictionaries with the exact same keys so that
+    :class:`~valuation.dcf_model.DCFModel` and
+    :func:`~valuation.report_generator.run_scenario_analysis` work
+    transparently with any data source.
+    """
+
+    @abstractmethod
+    def get_cash_flow_statement(self) -> dict[str, Any]:
+        """Return the most recent annual cash flow statement."""
+
+    @abstractmethod
+    def get_enterprise_metrics(self) -> dict[str, Any]:
+        """Return key enterprise-value metrics (debt, cash, shares)."""
+
+    @abstractmethod
+    def get_wacc(self) -> dict[str, Any]:
+        """Return the Weighted Average Cost of Capital and its components."""
+
+    @abstractmethod
+    def get_current_price(self) -> dict[str, Any]:
+        """Return the current market price for the stock."""
+
+    @abstractmethod
+    def get_historical_fcf_growth(self, years: int = 5) -> float:
+        """Compute the historical average annual FCF growth rate."""
+
+
+# ---------------------------------------------------------------------------
+# FMP fetcher (US stocks)
 # ---------------------------------------------------------------------------
 
 _BASE_V3 = "https://financialmodelingprep.com/api/v3"
@@ -35,7 +79,7 @@ _BASE_V4 = "https://financialmodelingprep.com/api/v4"
 _REQUEST_TIMEOUT = 15  # seconds
 
 
-class FinancialDataFetcher:
+class FMPDataFetcher(BaseDataFetcher):
     """Fetches financial data for a given ticker from the FMP API.
 
     Parameters
@@ -54,7 +98,7 @@ class FinancialDataFetcher:
 
     Examples
     --------
-    >>> fetcher = FinancialDataFetcher("AAPL")
+    >>> fetcher = FMPDataFetcher("AAPL")
     >>> cf = fetcher.get_cash_flow_statement()
     >>> cf["freeCashFlow"]
     12345678900
@@ -381,3 +425,339 @@ class FinancialDataFetcher:
             if prev > 0 and curr > 0
         ]
         return sum(growth_rates) / len(growth_rates) if growth_rates else 0.05
+
+
+# ---------------------------------------------------------------------------
+# yfinance helper
+# ---------------------------------------------------------------------------
+
+
+def _yf_val(series: Any, *keys: str) -> float:
+    """Extract the first available numeric value from *series* by trying *keys*.
+
+    Returns ``0.0`` when no key matches or the value is NaN / None.
+    """
+    import math
+
+    for key in keys:
+        try:
+            val = series[key]
+        except (KeyError, TypeError):
+            continue
+        if val is None:
+            continue
+        try:
+            f = float(val)
+        except (TypeError, ValueError):
+            continue
+        if math.isnan(f):
+            continue
+        return f
+    return 0.0
+
+
+# ---------------------------------------------------------------------------
+# yfinance fetcher (Indian stocks: .NS / .BO)
+# ---------------------------------------------------------------------------
+
+
+class YFinanceDataFetcher(BaseDataFetcher):
+    """Fetches financial data for Indian equities using the yfinance library.
+
+    Supports tickers ending in ``.NS`` (NSE) and ``.BO`` (BSE).
+
+    WACC Proxy
+    ----------
+    * **Cost of Equity** – CAPM with risk-free rate 7 % and market return 12 %.
+    * **Cost of Debt** – Default 10 %.
+    * **Tax Rate** – Default 25 %.
+
+    Parameters
+    ----------
+    ticker:
+        The equity ticker symbol (e.g. ``"RELIANCE.NS"``).
+    """
+
+    _RISK_FREE_RATE: float = 0.07
+    _MARKET_RETURN: float = 0.12
+    _DEFAULT_COST_OF_DEBT: float = 0.10
+    _DEFAULT_TAX_RATE: float = 0.25
+
+    def __init__(self, ticker: str) -> None:
+        self.ticker: str = ticker.upper().strip()
+
+    # ------------------------------------------------------------------
+    # Private helpers
+    # ------------------------------------------------------------------
+
+    def _stock(self):  # type: ignore[no-untyped-def]
+        import yfinance as yf
+
+        return yf.Ticker(self.ticker)
+
+    def _safe_info(self) -> dict[str, Any]:
+        info = self._stock().info or {}
+        if not info:
+            raise DataFetchError(
+                f"yfinance returned no data for ticker '{self.ticker}'.  "
+                "Verify the symbol is valid."
+            )
+        return info
+
+    def _safe_cash_flow(self) -> Any:
+        """Return the annual cash flow DataFrame (rows=metrics, cols=dates)."""
+        import pandas as pd
+
+        cf = self._stock().cash_flow
+        if cf is None or (isinstance(cf, pd.DataFrame) and cf.empty):
+            raise DataFetchError(
+                f"yfinance returned no cash flow data for '{self.ticker}'."
+            )
+        return cf
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def get_cash_flow_statement(self, limit: int = 1) -> dict[str, Any]:  # noqa: ARG002
+        """Return the most recent annual cash flow statement via yfinance.
+
+        Returns
+        -------
+        dict[str, Any]
+            Dictionary with keys ``freeCashFlow``, ``operatingCashFlow``,
+            ``capitalExpenditure``, and ``date``.
+
+        Raises
+        ------
+        DataFetchError
+            If yfinance returns no data for the ticker.
+        """
+        cf = self._safe_cash_flow()
+        latest = cf.iloc[:, 0]  # columns are newest-first
+
+        operating_cf = _yf_val(
+            latest, "Operating Cash Flow", "Total Cash From Operating Activities"
+        )
+        capex = _yf_val(latest, "Capital Expenditure", "Capital Expenditures")
+        fcf = _yf_val(latest, "Free Cash Flow")
+        if fcf == 0.0:
+            fcf = operating_cf + capex  # capex is typically negative
+
+        col = cf.columns[0]
+        date_str = str(col.date()) if hasattr(col, "date") else str(col)
+
+        return {
+            "freeCashFlow": fcf,
+            "operatingCashFlow": operating_cf,
+            "capitalExpenditure": capex,
+            "date": date_str,
+        }
+
+    def get_enterprise_metrics(self) -> dict[str, Any]:
+        """Return enterprise metrics (debt, cash, shares) via yfinance.
+
+        Returns
+        -------
+        dict[str, Any]
+            Dictionary with keys ``totalDebt``, ``cashAndCashEquivalents``,
+            ``sharesOutstanding``, and ``date``.
+
+        Raises
+        ------
+        DataFetchError
+            If yfinance returns no info for the ticker.
+        """
+        info = self._safe_info()
+        total_debt = float(info.get("totalDebt") or 0)
+        cash = float(
+            info.get("totalCash") or info.get("cashAndCashEquivalents") or 0
+        )
+        shares = float(info.get("sharesOutstanding") or 0)
+        return {
+            "totalDebt": total_debt,
+            "cashAndCashEquivalents": cash,
+            "sharesOutstanding": shares,
+            "date": "",
+        }
+
+    def get_wacc(self) -> dict[str, Any]:
+        """Compute a proxy WACC using CAPM for cost of equity.
+
+        Uses beta from yfinance ``.info``.  Cost of debt and tax rate are
+        fixed at 10 % and 25 % respectively.
+
+        Returns
+        -------
+        dict[str, Any]
+            Dictionary with keys ``wacc``, ``costOfEquity``, ``costOfDebt``,
+            ``taxRate``, ``equityWeight``, and ``debtWeight``.
+
+        Raises
+        ------
+        DataFetchError
+            If yfinance returns no info for the ticker.
+        """
+        import math
+
+        info = self._safe_info()
+
+        beta = info.get("beta") or 1.0
+        try:
+            beta = float(beta)
+            if math.isnan(beta):
+                beta = 1.0
+        except (TypeError, ValueError):
+            beta = 1.0
+
+        cost_of_equity = (
+            self._RISK_FREE_RATE
+            + beta * (self._MARKET_RETURN - self._RISK_FREE_RATE)
+        )
+        cost_of_debt = self._DEFAULT_COST_OF_DEBT
+        tax_rate = self._DEFAULT_TAX_RATE
+
+        market_cap = float(info.get("marketCap") or 0)
+        total_debt = float(info.get("totalDebt") or 0)
+        total_capital = market_cap + total_debt
+
+        if total_capital > 0:
+            equity_weight = market_cap / total_capital
+            debt_weight = total_debt / total_capital
+        else:
+            equity_weight = 1.0
+            debt_weight = 0.0
+
+        wacc = (
+            equity_weight * cost_of_equity
+            + debt_weight * cost_of_debt * (1.0 - tax_rate)
+        )
+
+        return {
+            "wacc": wacc,
+            "costOfEquity": cost_of_equity,
+            "costOfDebt": cost_of_debt,
+            "taxRate": tax_rate,
+            "equityWeight": equity_weight,
+            "debtWeight": debt_weight,
+        }
+
+    def get_current_price(self) -> dict[str, Any]:
+        """Return the current market price via yfinance.
+
+        Returns
+        -------
+        dict[str, Any]
+            Dictionary with keys ``price`` (float) and ``symbol`` (str).
+
+        Raises
+        ------
+        DataFetchError
+            If no price field is available from yfinance.
+        """
+        info = self._safe_info()
+        price = (
+            info.get("currentPrice")
+            or info.get("regularMarketPrice")
+            or info.get("previousClose")
+        )
+        if price is None:
+            raise DataFetchError(
+                f"Could not retrieve current price for '{self.ticker}' via yfinance."
+            )
+        return {
+            "price": float(price),
+            "symbol": self.ticker,
+        }
+
+    def get_historical_fcf_growth(self, years: int = 5) -> float:
+        """Compute the historical average annual FCF growth rate via yfinance.
+
+        Parameters
+        ----------
+        years:
+            Number of historical annual periods to include.  Defaults to
+            ``5``.
+
+        Returns
+        -------
+        float
+            Historical FCF growth rate as a decimal (e.g. ``0.08`` for 8 %).
+            Returns ``0.05`` as a default when insufficient data is available.
+        """
+        try:
+            cf = self._safe_cash_flow()
+        except DataFetchError:
+            return 0.05
+
+        n_cols = min(years, cf.shape[1])
+        if n_cols < 2:
+            return 0.05
+
+        # Columns are newest-first; build oldest-first FCF list.
+        fcf_values: list[float] = []
+        for i in range(n_cols - 1, -1, -1):  # oldest → newest
+            col = cf.iloc[:, i]
+            operating_cf = _yf_val(
+                col, "Operating Cash Flow", "Total Cash From Operating Activities"
+            )
+            capex = _yf_val(col, "Capital Expenditure", "Capital Expenditures")
+            fcf = _yf_val(col, "Free Cash Flow")
+            if fcf == 0.0:
+                fcf = operating_cf + capex
+            fcf_values.append(fcf)
+
+        if len(fcf_values) < 2:
+            return 0.05
+
+        oldest, latest = fcf_values[0], fcf_values[-1]
+        n = len(fcf_values) - 1
+
+        if oldest > 0 and latest > 0:
+            return (latest / oldest) ** (1.0 / n) - 1.0
+
+        growth_rates = [
+            curr / prev - 1.0
+            for prev, curr in zip(fcf_values, fcf_values[1:])
+            if prev > 0 and curr > 0
+        ]
+        return sum(growth_rates) / len(growth_rates) if growth_rates else 0.05
+
+
+# ---------------------------------------------------------------------------
+# Factory / router
+# ---------------------------------------------------------------------------
+
+
+def get_fetcher(ticker: str, api_key: str | None = None) -> BaseDataFetcher:
+    """Return the appropriate data fetcher for *ticker*.
+
+    Routes Indian exchange tickers (ending in ``.NS`` or ``.BO``) to
+    :class:`YFinanceDataFetcher` and all other tickers to
+    :class:`FMPDataFetcher`.
+
+    Parameters
+    ----------
+    ticker:
+        Equity ticker symbol.
+    api_key:
+        FMP API key (only used when routing to :class:`FMPDataFetcher`).
+
+    Returns
+    -------
+    BaseDataFetcher
+        An initialised fetcher ready to call.
+    """
+    normalised = ticker.upper().strip()
+    if normalised.endswith(".NS") or normalised.endswith(".BO"):
+        return YFinanceDataFetcher(normalised)
+    return FMPDataFetcher(normalised, api_key=api_key)
+
+
+# ---------------------------------------------------------------------------
+# Backward-compatibility alias
+# ---------------------------------------------------------------------------
+
+#: Alias kept so that existing code importing ``FinancialDataFetcher``
+#: continues to work without modification.
+FinancialDataFetcher = FMPDataFetcher

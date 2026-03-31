@@ -18,7 +18,7 @@ from openpyxl import load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
-from .data_fetcher import FinancialDataFetcher
+from .data_fetcher import get_fetcher
 from .dcf_model import DCFModel
 
 # ---------------------------------------------------------------------------
@@ -115,7 +115,7 @@ def run_scenario_analysis(ticker: str, api_key: str | None = None) -> str:
         not greater than terminal growth rate).
     """
     ticker = ticker.upper().strip()
-    fetcher = FinancialDataFetcher(ticker, api_key=api_key)
+    fetcher = get_fetcher(ticker, api_key=api_key)
 
     # --- Fetch all required financial data ---
     cash_flow_data = fetcher.get_cash_flow_statement()
