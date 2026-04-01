@@ -351,6 +351,7 @@ def _make_mock_cf_df(
     free_cf: float = 1_000_000_000,
     op_cf: float = 1_200_000_000,
     capex: float = -200_000_000,
+    da: float = 100_000_000,
 ) -> MagicMock:
     """Build a mock yfinance cash_flow DataFrame with one column."""
     import pandas as pd
@@ -361,6 +362,7 @@ def _make_mock_cf_df(
             "Free Cash Flow": free_cf,
             "Operating Cash Flow": op_cf,
             "Capital Expenditure": capex,
+            "Depreciation And Amortization": da,
         }
     }
     return pd.DataFrame(data)
@@ -391,21 +393,63 @@ class TestYFinanceGetCashFlowStatement(unittest.TestCase):
             self.assertIn(key, result)
 
     def test_free_cash_flow_value(self) -> None:
-        fetcher = self._fetcher_with_cf(_make_mock_cf_df(free_cf=5_000_000_000))
+        # Normalized FCF = OCF(1.2 B) – DA(100 M) = 1.1 B
+        fetcher = self._fetcher_with_cf(_make_mock_cf_df())
         result = fetcher.get_cash_flow_statement()
-        self.assertAlmostEqual(result["freeCashFlow"], 5_000_000_000)
+        self.assertAlmostEqual(result["freeCashFlow"], 1_100_000_000)
 
-    def test_fcf_computed_from_op_minus_capex_when_missing(self) -> None:
+    def test_normalized_fcf_ignores_raw_fcf_row(self) -> None:
+        """freeCashFlow must equal OCF − DA, not the raw 'Free Cash Flow' row."""
         import pandas as pd
 
         date_idx = pd.Timestamp("2023-03-31")
-        # No 'Free Cash Flow' row – should fall back to op + capex
+        # Raw FCF row present with a huge value; it must be ignored.
+        cf_df = pd.DataFrame(
+            {
+                date_idx: {
+                    "Free Cash Flow": 9_999_999_999,
+                    "Operating Cash Flow": 1_200_000_000,
+                    "Capital Expenditure": -200_000_000,
+                    "Depreciation And Amortization": 200_000_000,
+                }
+            }
+        )
+        fetcher = self._fetcher_with_cf(cf_df)
+        result = fetcher.get_cash_flow_statement()
+        # Normalized FCF = 1.2 B – 200 M = 1 B (not 9.99 B)
+        self.assertAlmostEqual(result["freeCashFlow"], 1_000_000_000)
+
+    def test_normalized_fcf_when_da_is_missing(self) -> None:
+        """When no D&A row is present, normalized FCF = Operating Cash Flow."""
+        import pandas as pd
+
+        date_idx = pd.Timestamp("2023-03-31")
         cf_df = pd.DataFrame(
             {date_idx: {"Operating Cash Flow": 1_200_000_000, "Capital Expenditure": -200_000_000}}
         )
         fetcher = self._fetcher_with_cf(cf_df)
         result = fetcher.get_cash_flow_statement()
-        self.assertAlmostEqual(result["freeCashFlow"], 1_000_000_000)
+        # D&A row absent → _yf_val returns 0.0 → normalized_fcf = OCF(1.2 B) − 0 = 1.2 B
+        self.assertAlmostEqual(result["freeCashFlow"], 1_200_000_000)
+
+    def test_negative_normalized_fcf_raises(self) -> None:
+        """Negative Normalized FCF must raise DataFetchError."""
+        import pandas as pd
+
+        date_idx = pd.Timestamp("2023-03-31")
+        # DA > OCF → normalized FCF is negative
+        cf_df = pd.DataFrame(
+            {
+                date_idx: {
+                    "Operating Cash Flow": 500_000_000,
+                    "Depreciation And Amortization": 800_000_000,
+                }
+            }
+        )
+        fetcher = self._fetcher_with_cf(cf_df)
+        with self.assertRaises(DataFetchError) as ctx:
+            fetcher.get_cash_flow_statement()
+        self.assertIn("Normalized FCF is negative", str(ctx.exception))
 
     def test_empty_dataframe_raises(self) -> None:
         import pandas as pd
@@ -458,6 +502,95 @@ class TestYFinanceGetEnterpriseMetrics(unittest.TestCase):
         fetcher = self._fetcher_with_info({})
         with self.assertRaises(DataFetchError):
             fetcher.get_enterprise_metrics()
+
+    def test_shares_calculated_from_market_cap_and_price(self) -> None:
+        """Shares = marketCap / currentPrice when both fields are present."""
+        info = {
+            "totalDebt": 500_000_000,
+            "totalCash": 200_000_000,
+            "marketCap": 1_000_000_000,
+            "currentPrice": 100.0,
+            "sharesOutstanding": 1_234_567_890,  # must be ignored
+        }
+        fetcher = self._fetcher_with_info(info)
+        result = fetcher.get_enterprise_metrics()
+        # 1_000_000_000 / 100.0 = 10_000_000
+        self.assertAlmostEqual(result["sharesOutstanding"], 10_000_000)
+
+    def test_shares_fallback_to_outstanding_when_market_cap_missing(self) -> None:
+        """Fall back to sharesOutstanding when marketCap is absent."""
+        fetcher = self._fetcher_with_info(self._SAMPLE_INFO)  # no marketCap
+        result = fetcher.get_enterprise_metrics()
+        self.assertAlmostEqual(result["sharesOutstanding"], 6_760_000_000)
+
+    def test_shares_fallback_when_price_is_zero(self) -> None:
+        """Fall back to sharesOutstanding when currentPrice is zero."""
+        info = {
+            "totalDebt": 500_000_000,
+            "totalCash": 200_000_000,
+            "marketCap": 1_000_000_000,
+            "currentPrice": 0.0,
+            "sharesOutstanding": 6_760_000_000,
+        }
+        fetcher = self._fetcher_with_info(info)
+        result = fetcher.get_enterprise_metrics()
+        self.assertAlmostEqual(result["sharesOutstanding"], 6_760_000_000)
+
+
+class TestYFinanceSanitizeUnits(unittest.TestCase):
+    """Unit tests for YFinanceDataFetcher._sanitize_units()."""
+
+    def _fetcher(self) -> YFinanceDataFetcher:
+        return _make_yf_fetcher()
+
+    def _make_cf(self, fcf: float, op_cf: float = 1_200_000_000, capex: float = -200_000_000) -> dict:
+        return {"freeCashFlow": fcf, "operatingCashFlow": op_cf, "capitalExpenditure": capex, "date": "2023-03-31"}
+
+    def test_no_scaling_when_ratio_is_normal(self) -> None:
+        """When debt / FCF < 10 000, cash-flow values must be unchanged."""
+        fetcher = self._fetcher()
+        cf = self._make_cf(fcf=1_000_000_000)
+        em = {"totalDebt": 5_000_000_000}  # ratio = 5
+        result_cf, _ = fetcher._sanitize_units(cf, em)
+        self.assertAlmostEqual(result_cf["freeCashFlow"], 1_000_000_000)
+        self.assertAlmostEqual(result_cf["operatingCashFlow"], 1_200_000_000)
+
+    def test_scales_by_1000_when_ratio_above_10000(self) -> None:
+        """When 10 000 < debt / FCF ≤ 10 000 000, multiply CF values by 1 000."""
+        fetcher = self._fetcher()
+        # FCF in thousands, debt in raw → ratio = 5_000_000_000 / 400_000 = 12_500×
+        cf = self._make_cf(fcf=400_000, op_cf=600_000, capex=-100_000)
+        em = {"totalDebt": 5_000_000_000}
+        result_cf, _ = fetcher._sanitize_units(cf, em)
+        self.assertAlmostEqual(result_cf["freeCashFlow"], 400_000 * 1_000)
+        self.assertAlmostEqual(result_cf["operatingCashFlow"], 600_000 * 1_000)
+        self.assertAlmostEqual(result_cf["capitalExpenditure"], -100_000 * 1_000)
+
+    def test_scales_by_1000000_when_ratio_above_10000000(self) -> None:
+        """When debt / FCF > 10 000 000, multiply CF values by 1 000 000."""
+        fetcher = self._fetcher()
+        # FCF in raw units (very small), debt huge → ratio > 10_000_000
+        cf = self._make_cf(fcf=100, op_cf=120, capex=-20)
+        em = {"totalDebt": 5_000_000_000}  # ratio = 50_000_000
+        result_cf, _ = fetcher._sanitize_units(cf, em)
+        self.assertAlmostEqual(result_cf["freeCashFlow"], 100 * 1_000_000)
+        self.assertAlmostEqual(result_cf["operatingCashFlow"], 120 * 1_000_000)
+
+    def test_no_scaling_when_fcf_is_zero(self) -> None:
+        """When FCF is zero, sanitization must be a no-op."""
+        fetcher = self._fetcher()
+        cf = self._make_cf(fcf=0)
+        em = {"totalDebt": 5_000_000_000}
+        result_cf, _ = fetcher._sanitize_units(cf, em)
+        self.assertEqual(result_cf["freeCashFlow"], 0)
+
+    def test_enterprise_dict_returned_unchanged(self) -> None:
+        """The enterprise dict must always be returned unmodified."""
+        fetcher = self._fetcher()
+        cf = self._make_cf(fcf=500_000)
+        em = {"totalDebt": 5_000_000_000, "cashAndCashEquivalents": 100_000_000}
+        _, result_em = fetcher._sanitize_units(cf, em)
+        self.assertDictEqual(result_em, em)
 
 
 class TestYFinanceGetWacc(unittest.TestCase):
