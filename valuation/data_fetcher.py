@@ -515,6 +515,50 @@ class YFinanceDataFetcher(BaseDataFetcher):
             )
         return cf
 
+    def _sanitize_units(
+        self,
+        cash_flow_dict: dict[str, Any],
+        enterprise_dict: dict[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Correct unit mismatches between cash-flow and enterprise dictionaries.
+
+        yfinance occasionally mixes units (e.g. cash-flow figures in thousands
+        while debt figures are in raw currency).  When the absolute ratio of
+        ``totalDebt`` to ``freeCashFlow`` exceeds 10 000 the method assumes a
+        mismatch and scales the cash-flow values upward.
+
+        Parameters
+        ----------
+        cash_flow_dict:
+            Dictionary as returned by :meth:`get_cash_flow_statement`.
+        enterprise_dict:
+            Dictionary as returned by :meth:`get_enterprise_metrics` (only
+            ``totalDebt`` is required).
+
+        Returns
+        -------
+        tuple[dict[str, Any], dict[str, Any]]
+            ``(cash_flow_dict, enterprise_dict)`` – the cash-flow dict may be
+            a new copy with scaled monetary fields; the enterprise dict is
+            returned unchanged.
+        """
+        total_debt = float(enterprise_dict.get("totalDebt") or 0)
+        fcf = float(cash_flow_dict.get("freeCashFlow") or 0)
+
+        if fcf == 0:
+            return cash_flow_dict, enterprise_dict
+
+        ratio = abs(total_debt / fcf)
+
+        if ratio > 10_000:
+            scale = 1_000_000 if ratio > 10_000_000 else 1_000
+            cash_flow_dict = dict(cash_flow_dict)
+            for key in ("freeCashFlow", "operatingCashFlow", "capitalExpenditure"):
+                if cash_flow_dict.get(key) is not None:
+                    cash_flow_dict[key] = cash_flow_dict[key] * scale
+
+        return cash_flow_dict, enterprise_dict
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -522,16 +566,27 @@ class YFinanceDataFetcher(BaseDataFetcher):
     def get_cash_flow_statement(self, limit: int = 1) -> dict[str, Any]:  # noqa: ARG002
         """Return the most recent annual cash flow statement via yfinance.
 
+        Uses a *Normalized FCF* instead of the raw Free Cash Flow figure.
+        Heavy-CapEx companies (e.g. Reliance) can show artificially negative
+        raw FCF (``Operating Cash Flow − total CapEx``) because growth CapEx
+        swamps maintenance spending.  This method instead uses
+        ``Operating Cash Flow − Depreciation & Amortization`` as a proxy for
+        cash generation from existing assets, stripping out both growth and
+        maintenance CapEx so that the metric remains positive for mature
+        businesses with high reinvestment.
+
         Returns
         -------
         dict[str, Any]
-            Dictionary with keys ``freeCashFlow``, ``operatingCashFlow``,
+            Dictionary with keys ``freeCashFlow`` (normalized), ``operatingCashFlow``,
             ``capitalExpenditure``, and ``date``.
 
         Raises
         ------
         DataFetchError
-            If yfinance returns no data for the ticker.
+            If yfinance returns no data for the ticker, or if the Normalized
+            FCF for the most recent period is negative (making a standard DCF
+            projection unreliable for that period).
         """
         cf = self._safe_cash_flow()
         latest = cf.iloc[:, 0]  # columns are newest-first
@@ -540,22 +595,52 @@ class YFinanceDataFetcher(BaseDataFetcher):
             latest, "Operating Cash Flow", "Total Cash From Operating Activities"
         )
         capex = _yf_val(latest, "Capital Expenditure", "Capital Expenditures")
-        fcf = _yf_val(latest, "Free Cash Flow")
-        if fcf == 0.0:
-            fcf = operating_cf + capex  # capex is typically negative
+
+        # Extract Depreciation & Amortization (several yfinance field name variants).
+        da = _yf_val(
+            latest,
+            "Depreciation And Amortization",
+            "Depreciation",
+            "Reconciled Depreciation",
+            "Depreciation Amortization Depletion",
+        )
+
+        # Normalized FCF = Operating Cash Flow − D&A (sustaining-capex proxy).
+        normalized_fcf = operating_cf - da
+
+        if normalized_fcf < 0:
+            raise DataFetchError(
+                "Normalized FCF is negative; standard DCF cannot be reliably modeled."
+            )
 
         col = cf.columns[0]
         date_str = str(col.date()) if hasattr(col, "date") else str(col)
 
-        return {
-            "freeCashFlow": fcf,
+        result: dict[str, Any] = {
+            "freeCashFlow": normalized_fcf,
             "operatingCashFlow": operating_cf,
             "capitalExpenditure": capex,
             "date": date_str,
         }
 
+        # Apply unit-mismatch sanitization when enterprise info is accessible.
+        try:
+            raw_info = self._stock().info
+            if isinstance(raw_info, dict) and raw_info:
+                total_debt = float(raw_info.get("totalDebt") or 0)
+                result, _ = self._sanitize_units(result, {"totalDebt": total_debt})
+        except Exception:  # noqa: BLE001
+            pass  # sanitization is best-effort; never block a valid CF result
+
+        return result
+
     def get_enterprise_metrics(self) -> dict[str, Any]:
         """Return enterprise metrics (debt, cash, shares) via yfinance.
+
+        Shares outstanding are calculated dynamically as ``Market Cap ÷ Current
+        Price`` when both fields are available, which is more reliable than the
+        ``sharesOutstanding`` field for non-US equities.  ``sharesOutstanding``
+        is used only as a fallback when ``marketCap`` is absent.
 
         Returns
         -------
@@ -573,7 +658,21 @@ class YFinanceDataFetcher(BaseDataFetcher):
         cash = float(
             info.get("totalCash") or info.get("cashAndCashEquivalents") or 0
         )
-        shares = float(info.get("sharesOutstanding") or 0)
+
+        # Prefer dynamically-derived shares (marketCap / currentPrice) over the
+        # .info sharesOutstanding field, which yfinance often mis-reports for
+        # non-US stocks.
+        market_cap = info.get("marketCap")
+        current_price = (
+            info.get("currentPrice")
+            or info.get("regularMarketPrice")
+            or info.get("previousClose")
+        )
+        if market_cap and current_price and float(current_price) > 0:
+            shares = float(market_cap) / float(current_price)
+        else:
+            shares = float(info.get("sharesOutstanding") or 0)
+
         return {
             "totalDebt": total_debt,
             "cashAndCashEquivalents": cash,
